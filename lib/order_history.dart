@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_staggered_animations/flutter_staggered_animations.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:responsive_builder/responsive_builder.dart';
+import 'dart:js' as js;
+import 'package:universal_html/html.dart' as html;
+import 'dart:async';
 
 class OrderHistoryPage extends StatefulWidget {
   final String managerCode;
@@ -22,8 +25,10 @@ class _OrderHistoryPageState extends State<OrderHistoryPage> {
   final int _pageSize = 10;
   bool _hasMore = true;
   bool _isLoadingMore = false;
+  bool _isPaymentLoading = false;
   List<DocumentSnapshot> _orders = [];
   final ScrollController _scrollController = ScrollController();
+  static const String _razorpayKeyId = 'rzp_test_p9V24bWT3a35ky';
 
   @override
   void initState() {
@@ -96,20 +101,7 @@ class _OrderHistoryPageState extends State<OrderHistoryPage> {
       }
     } catch (e) {
       debugPrint('Error loading more orders: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Failed to load more orders: $e',
-              style: GoogleFonts.poppins(color: Colors.white, fontSize: 14),
-            ),
-            backgroundColor: Colors.red.shade500,
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-            duration: const Duration(seconds: 3),
-          ),
-        );
-      }
+      _showError('Failed to load more orders: $e');
     } finally {
       setState(() {
         _isLoadingMore = false;
@@ -120,6 +112,194 @@ class _OrderHistoryPageState extends State<OrderHistoryPage> {
   bool _isValidCustomerId(String id) {
     final uuidPattern = RegExp(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$');
     return uuidPattern.hasMatch(id);
+  }
+
+  void _showError(String message) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            message,
+            style: GoogleFonts.poppins(color: Colors.white, fontSize: 14),
+          ),
+          backgroundColor: Colors.red.shade500,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+  }
+
+  void _showSuccess(String message) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            message,
+            style: GoogleFonts.poppins(color: Colors.white, fontSize: 14),
+          ),
+          backgroundColor: Colors.teal.shade600,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+  }
+
+  void _loadRazorpayScript() {
+    if (html.document.getElementById('razorpay-checkout-js') == null) {
+      final script = html.ScriptElement()
+        ..id = 'razorpay-checkout-js'
+        ..src = 'https://checkout.razorpay.com/v1/checkout.js'
+        ..async = true;
+      html.document.head?.append(script);
+    }
+  }
+
+  Future<void> _initiatePaymentForOrder(String orderId, double amount, Map<String, dynamic> order) async {
+    final customerPhone = order['customerPhone'] as String? ?? '';
+    if (customerPhone.isEmpty) {
+      _showError('Customer phone number missing. Please contact support.');
+      return;
+    }
+    if (_razorpayKeyId == 'YOUR_RAZORPAY_KEY_ID') {
+      _showError('Razorpay Key ID is not configured. Contact support.');
+      return;
+    }
+    setState(() {
+      _isPaymentLoading = true;
+    });
+
+    try {
+      _loadRazorpayScript();
+      await Future.delayed(const Duration(seconds: 1));
+      final completer = Completer<void>();
+      js.context['flutterPaymentSuccess'] = (js.JsObject response) {
+        final paymentId = response['razorpay_payment_id'] as String?;
+        final razorpayOrderId = response['razorpay_order_id'] as String?;
+        final signature = response['razorpay_signature'] as String?;
+        _handlePaymentSuccess(paymentId, razorpayOrderId, signature, orderId);
+        completer.complete();
+      };
+      js.context['flutterPaymentError'] = (js.JsObject error) {
+        final message = error['description'] as String? ?? 'Unknown error';
+        _handlePaymentError(message);
+        completer.complete();
+      };
+      js.context['flutterPaymentCancelled'] = () {
+        _handlePaymentError('Payment cancelled by user');
+        completer.complete();
+      };
+      final options = js.JsObject.jsify({
+        'key': _razorpayKeyId,
+        'amount': (amount * 100).toInt(),
+        'currency': 'INR',
+        'name': "Margam's Kitchen",
+        'description': 'Payment for order #$orderId',
+        'handler': js.JsFunction.withThis((_, response) {
+          js.context.callMethod('flutterPaymentSuccess', [response]);
+        }),
+        'prefill': {
+          'contact': customerPhone,
+          'email': 'customer@example.com',
+        },
+        'notes': {
+          'orderId': orderId,
+          'customerId': widget.customerId,
+          'managerCode': widget.managerCode,
+        },
+        'theme': {
+          'color': '#26A69A',
+        },
+        'modal': {
+          'ondismiss': js.allowInterop(() {
+            js.context.callMethod('flutterPaymentCancelled');
+          }),
+        },
+        'method': {
+          'netbanking': true,
+          'card': true,
+          'upi': true,
+          'wallet': true,
+        },
+        '_': {
+          'integration': 'flutter_web',
+          'version': '1.0'
+        }
+      });
+      final rzp = js.JsObject(js.context['Razorpay'], [options]);
+      rzp.callMethod('on', [
+        'payment.failed',
+        js.allowInterop((error) {
+          js.context.callMethod('flutterPaymentError', [error['error']]);
+        }),
+      ]);
+      rzp.callMethod('open');
+      await completer.future;
+      setState(() {
+        _isPaymentLoading = false;
+      });
+    } catch (e) {
+      debugPrint('Payment initiation error: $e');
+      _showError('Failed to initiate payment: $e');
+      setState(() {
+        _isPaymentLoading = false;
+      });
+    }
+  }
+
+  void _handlePaymentSuccess(String? paymentId, String? razorpayOrderId, String? signature, String orderId) {
+    setState(() {
+      _isPaymentLoading = false;
+    });
+    debugPrint('Payment success: PaymentID=$paymentId, OrderID=$orderId');
+    _placeOrderAfterPayment(orderId, paymentId, razorpayOrderId, signature);
+    _showSuccess('Payment successful! View your bill.');
+  }
+
+  void _handlePaymentError(String message) {
+    setState(() {
+      _isPaymentLoading = false;
+    });
+    _showError('Payment failed: $message');
+    debugPrint('Payment error: $message');
+  }
+
+  Future<void> _placeOrderAfterPayment(String orderId, String? paymentId, String? razorpayOrderId, String? signature) async {
+    try {
+      final ordersSnapshot = await FirebaseFirestore.instance
+          .collection('orders')
+          .where('orderId', isEqualTo: orderId)
+          .get();
+      if (ordersSnapshot.docs.isEmpty) {
+        _showError('Order not found.');
+        debugPrint('Error: No orders found for orderId: $orderId');
+        return;
+      }
+      for (var doc in ordersSnapshot.docs) {
+        await doc.reference.update({
+          'paymentStatus': 'completed',
+          'razorpayPaymentId': paymentId,
+          'razorpayOrderId': razorpayOrderId,
+          'razorpaySignature': signature,
+          'updatedAt': Timestamp.now(),
+        });
+        debugPrint(
+            'Updated order ${doc.id} with payment details: PaymentID=$paymentId');
+      }
+      setState(() {
+        _isPaymentLoading = false;
+      });
+      debugPrint('Payment completed for order: $orderId');
+    } catch (e) {
+      setState(() {
+        _isPaymentLoading = false;
+      });
+      _showError('Failed to update order with payment: $e');
+      debugPrint('Error updating order with payment: $e');
+    }
   }
 
   void _showBillDialog(Map<String, dynamic> order, bool isDesktop) {
@@ -827,7 +1007,38 @@ class _OrderHistoryPageState extends State<OrderHistoryPage> {
                                   ),
                                 ],
                               ),
-                              if (paymentStatus.toLowerCase() == 'completed') ...[
+                              if (status.toLowerCase() == 'prepared' && paymentStatus.toLowerCase() == 'pending') ...[
+                                const SizedBox(height: 12),
+                                Center(
+                                  child: ElevatedButton(
+                                    onPressed: _isPaymentLoading
+                                        ? null
+                                        : () => _initiatePaymentForOrder(orderId, total, order),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.teal.shade400,
+                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                                    ),
+                                    child: _isPaymentLoading
+                                        ? const SizedBox(
+                                            width: 24,
+                                            height: 24,
+                                            child: CircularProgressIndicator(
+                                              color: Colors.white,
+                                              strokeWidth: 2,
+                                            ),
+                                          )
+                                        : Text(
+                                            'Pay Now',
+                                            style: GoogleFonts.poppins(
+                                              color: Colors.white,
+                                              fontSize: fontSize - 2,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                  ),
+                                ),
+                              ] else if (paymentStatus.toLowerCase() == 'completed') ...[
                                 const SizedBox(height: 12),
                                 Center(
                                   child: ElevatedButton(
